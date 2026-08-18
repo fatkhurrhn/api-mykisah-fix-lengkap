@@ -15,7 +15,7 @@ app.use(cors());
 app.use(express.json());
 
 // Konfigurasi
-const BASE_URL = 'https://kuramanime.ing';
+const BASE_URL = 'https://s1.kuramalink.app';
 
 // ============================================================
 // ENDPOINT: /anime/latest (Versi CEPAT tanpa Puppeteer)
