@@ -1,9 +1,10 @@
-// server-kuramanime.js
+// index.js - 
 import express from 'express';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import * as cheerio from 'cheerio';
 import cors from 'cors';
+import NodeCache from 'node-cache';
 
 // Gunakan stealth plugin
 puppeteer.use(StealthPlugin());
@@ -19,123 +20,172 @@ app.use(express.json());
 const BASE_URL = 'https://s1.kuramalink.app';
 
 // ============================================================
-// ENDPOINT: /anime/latest
+// 1. CACHE CONFIGURATION
 // ============================================================
-app.get('/anime/latest', async (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 20;
-        
-        console.log(`📡 Fetching /quick/ongoing?order_by=updated&page=${page}`);
-        
-        const url = `${BASE_URL}/quick/ongoing?order_by=updated&page=${page}`;
-        const result = await scrapeOngoingPage(url);
-        
-        // Pagination info
-        const pagination = {
-            currentPage: page,
-            totalPages: result.totalPages || 1,
-            hasNext: result.hasNext || false,
-            hasPrev: page > 1
-        };
-        
-        // Limit hasil
-        const items = result.items.slice(0, limit);
-        
-        res.json({
-            success: true,
-            source: 'Kuramanime',
-            url: url,
-            pagination: pagination,
-            total: items.length,
-            data: items
-        });
-        
-    } catch (error) {
-        console.error('❌ Error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
+const cache = new NodeCache({
+    stdTTL: 30,          // Default 30 detik
+    checkperiod: 10,
+    useClones: false
 });
 
-// server-kuramanime.js - Perbaiki bagian URL di scrapeOngoingPage dengan custom URL
+// ============================================================
+// 2. BROWSER INSTANCE (REUSE)
+// ============================================================
+let browserInstance = null;
+let browserRefCount = 0;
 
-async function scrapeOngoingPage(url) {
-    console.log(`🚀 Scraping: ${url}`);
-    
-    let browser = null;
-    try {
-        browser = await puppeteer.launch({
+async function getBrowser() {
+    if (!browserInstance) {
+        console.log('🚀 Launching browser (first time)...');
+        browserInstance = await puppeteer.launch({
             headless: "new",
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--window-size=1920x1080'
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-extensions',
+                '--disable-setuid-sandbox',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-component-extensions-with-background-pages'
             ]
         });
+    }
+    browserRefCount++;
+    return browserInstance;
+}
 
-        const page = await browser.newPage();
-        
+async function releaseBrowser() {
+    browserRefCount--;
+    if (browserRefCount < 0) browserRefCount = 0;
+}
+
+// Tutup browser saat server shutdown
+process.on('SIGTERM', async () => {
+    if (browserInstance) {
+        console.log('🔒 Closing browser...');
+        await browserInstance.close();
+        browserInstance = null;
+    }
+    process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+    if (browserInstance) {
+        console.log('🔒 Closing browser...');
+        await browserInstance.close();
+        browserInstance = null;
+    }
+    process.exit(0);
+});
+
+// ============================================================
+// 3. HELPER: SCRAPE DENGAN REUSE BROWSER
+// ============================================================
+async function scrapeWithBrowser(url, options = {}) {
+    const {
+        selector = '.product__item',
+        waitUntil = 'domcontentloaded',
+        timeout = 30000,
+        scroll = true,
+        scrollDistance = 1500,
+        delay = 500
+    } = options;
+
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+
+    try {
+        await page.setViewport({ width: 1280, height: 720 });
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         await page.setExtraHTTPHeaders({
             'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
             'Referer': 'https://kuramanime.ing/'
         });
 
+        // Block resource yang tidak perlu
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const resourceType = req.resourceType();
+            if (['image', 'font', 'media', 'stylesheet'].includes(resourceType)) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
+        console.log(`🌐 Loading: ${url}`);
         await page.goto(url, {
-            waitUntil: 'networkidle2',
-            timeout: 60000
+            waitUntil: waitUntil,
+            timeout: timeout
         });
 
-        await page.waitForSelector('.product__item', { timeout: 15000 });
+        if (scroll) {
+            await page.evaluate(async (distance) => {
+                window.scrollBy(0, distance);
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }, scrollDistance);
+        }
 
-        // Scroll
-        await page.evaluate(async () => {
-            await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 100;
-                const timer = setInterval(() => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-                    if (totalHeight >= scrollHeight || totalHeight > 3000) {
-                        clearInterval(timer);
-                        resolve();
-                    }
-                }, 100);
-            });
-        });
+        if (delay > 0) {
+            await page.waitForTimeout(delay);
+        }
 
-        await page.waitForTimeout(2000);
+        try {
+            await page.waitForSelector(selector, { timeout: 5000 });
+        } catch (e) {
+            console.log(`⚠️ Selector "${selector}" not found, continuing...`);
+        }
 
         const html = await page.content();
-        const $ = cheerio.load(html);
+        return cheerio.load(html);
 
-        // ============================================================
-        // Ambil daftar anime
-        // ============================================================
+    } finally {
+        await page.close();
+        await releaseBrowser();
+    }
+}
+
+// ============================================================
+// 4. SCRAPE ONGOING PAGE (LATEST)
+// ============================================================
+async function scrapeOngoingPage(url) {
+    console.log(`🚀 Scraping ongoing: ${url}`);
+
+    const cacheKey = `ongoing_${url}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        console.log(`✅ Cache HIT untuk ${url}`);
+        return cached;
+    }
+
+    try {
+        const $ = await scrapeWithBrowser(url, {
+            selector: '.product__item',
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+            scroll: true,
+            scrollDistance: 1500,
+            delay: 300
+        });
+
         const items = [];
         
         $('.product__item').each((i, el) => {
             const $el = $(el);
             
-            // ============================================================
-            // CARI LINK DETAIL
-            // ============================================================
             let episodeUrl = '';
             let animeId = null;
             let slug = '';
             
-            // 1. Cari dari .product__item__pic a
             const $picLink = $el.find('.product__item__pic a');
             if ($picLink.length) {
                 episodeUrl = $picLink.attr('href') || '';
             }
             
-            // 2. Jika kosong, cari dari .product__item__text h5 a
             if (!episodeUrl) {
                 const $titleLink = $el.find('.product__item__text h5 a');
                 if ($titleLink.length) {
@@ -143,7 +193,6 @@ async function scrapeOngoingPage(url) {
                 }
             }
             
-            // 3. Jika masih kosong, cari dari a langsung
             if (!episodeUrl) {
                 const $anyLink = $el.find('a');
                 $anyLink.each((i, link) => {
@@ -155,59 +204,39 @@ async function scrapeOngoingPage(url) {
                 });
             }
             
-            // ============================================================
-            // BERSIHKAN URL - HANYA PATH SAJA, TANPA DOMAIN
-            // ============================================================
             if (episodeUrl) {
-                // Extract path saja (hilangkan domain)
-                // Contoh: https://v18.kuramanime.ing/anime/4823/liar-game/episode/14
-                // Menjadi: /anime/4823/liar-game/episode/14
                 const pathMatch = episodeUrl.match(/(\/anime\/\d+\/[^\/]+(?:\/episode\/\d+)?)/);
                 if (pathMatch) {
                     episodeUrl = pathMatch[1];
                 } else {
-                    // Jika tidak match, set tetap path
                     episodeUrl = episodeUrl.replace(/^https?:\/\/[^\/]+/, '');
                 }
             }
             
-            // Extract ID dan slug dari URL
             if (episodeUrl) {
                 const idMatch = episodeUrl.match(/\/anime\/(\d+)/);
                 if (idMatch) {
                     animeId = idMatch[1];
                 }
                 
-                // Ambil slug untuk url_detail
                 const slugMatch = episodeUrl.match(/\/anime\/\d+\/([^\/]+)/);
                 if (slugMatch) {
                     slug = slugMatch[1];
                 }
             }
             
-            // ============================================================
-            // BUAT URL DETAIL DENGAN CUSTOM FORMAT
-            // ============================================================
             let detailUrl = '';
             if (animeId && slug) {
-                detailUrl = `/anime/detail/${animeId}/${slug}`;  // CUSTOM: /anime/detail/4823/liar-game
+                detailUrl = `/anime/detail/${animeId}/${slug}`;
             } else if (animeId) {
-                detailUrl = `/anime/detail/${animeId}`;          // CUSTOM: /anime/detail/4823
+                detailUrl = `/anime/detail/${animeId}`;
             }
             
-            // ============================================================
-            // BUAT URL EPISODE DENGAN CUSTOM FORMAT
-            // ============================================================
             let customEpisodeUrl = '';
             if (episodeUrl) {
-                // Ganti /anime/ dengan /anime/watch/
-                // Contoh: /anime/4823/liar-game/episode/14 -> /anime/watch/4823/liar-game/episode/14
                 customEpisodeUrl = episodeUrl.replace(/^\/anime\//, '/anime/watch/');
             }
             
-            // ============================================================
-            // Gambar
-            // ============================================================
             const $pic = $el.find('.product__item__pic');
             let imageUrl = $pic.attr('data-setbg') || '';
             if (!imageUrl) {
@@ -218,9 +247,6 @@ async function scrapeOngoingPage(url) {
                 }
             }
             
-            // ============================================================
-            // Episode info
-            // ============================================================
             const $ep = $el.find('.ep span');
             const episodeText = $ep.text().trim() || '';
             
@@ -228,23 +254,14 @@ async function scrapeOngoingPage(url) {
             const currentEpisode = epMatch ? parseInt(epMatch[1]) : null;
             const totalEpisode = epMatch ? (epMatch[2] === '?' ? null : parseInt(epMatch[2])) : null;
             
-            // ============================================================
-            // Type & Quality
-            // ============================================================
             const $type = $el.find('.product__item__text ul a:first-child li');
             const $quality = $el.find('.product__item__text ul a:last-child li');
             const type = $type.text().trim() || '';
             const quality = $quality.text().trim() || '';
             
-            // ============================================================
-            // Title
-            // ============================================================
             const $title = $el.find('.product__item__text h5 a');
             const title = $title.text().trim() || '';
             
-            // ============================================================
-            // Comments & Views
-            // ============================================================
             let comments = 0;
             let views = 0;
             
@@ -260,14 +277,11 @@ async function scrapeOngoingPage(url) {
                 views = parseInt(text) || 0;
             }
             
-            // ============================================================
-            // Push data
-            // ============================================================
             items.push({
                 id: animeId,
                 title: title,
-                url_detail: detailUrl,                    // CUSTOM: /anime/detail/4823/liar-game
-                url_episode: customEpisodeUrl,            // CUSTOM: /anime/watch/4823/liar-game/episode/14
+                url_detail: detailUrl,
+                url_episode: customEpisodeUrl,
                 image: imageUrl,
                 type: type,
                 quality: quality,
@@ -279,9 +293,6 @@ async function scrapeOngoingPage(url) {
             });
         });
 
-        // ============================================================
-        // Ambil pagination
-        // ============================================================
         let totalPages = 1;
         let hasNext = false;
         let currentPage = 1;
@@ -316,131 +327,47 @@ async function scrapeOngoingPage(url) {
             }
         });
 
-        console.log(`✅ Scraping selesai! Dapat ${items.length} anime`);
-
-        return {
+        const result = {
             items: items,
             totalPages: totalPages,
             currentPage: currentPage,
             hasNext: hasNext
         };
 
+        cache.set(cacheKey, result, 30);
+        console.log(`✅ Scraping selesai! Dapat ${items.length} anime (CACHED 30s)`);
+
+        return result;
+
     } catch (error) {
         console.error('❌ Error scraping:', error.message);
         throw error;
-    } finally {
-        if (browser) {
-            await browser.close();
-            console.log('🔒 Browser ditutup');
-        }
     }
 }
 
-
 // ============================================================
-// ENDPOINT: /anime/detail/:id/:slug?
+// 5. SCRAPE ANIME DETAIL
 // ============================================================
-app.get('/anime/detail/:id/:slug?', async (req, res) => {
-    try {
-        const animeId = req.params.id;
-        const slug = req.params.slug || '';
-        
-        // Cek apakah ID valid (hanya angka)
-        if (!animeId || !/^\d+$/.test(animeId)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid anime ID. Must be a number.'
-            });
-        }
-        
-        // Build URL dengan slug jika ada
-        let url;
-        if (slug) {
-            url = `${BASE_URL}/anime/${animeId}/${slug}`;
-        } else {
-            url = `${BASE_URL}/anime/${animeId}`;
-        }
-        
-        console.log(`📡 Fetching anime detail: ${url}`);
-        
-        const result = await scrapeAnimeDetail(url, animeId);
-        
-        if (!result || !result.id) {
-            return res.status(404).json({
-                success: false,
-                error: 'Anime not found'
-            });
-        }
-        
-        res.json({
-            success: true,
-            source: 'Kuramanime',
-            data: result
-        });
-        
-    } catch (error) {
-        console.error('❌ Error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// server-kuramanime.js - Perbaiki fungsi scrapeAnimeDetail dengan related anime
-
 async function scrapeAnimeDetail(url, animeId) {
-    let browser = null;
+    console.log(`🚀 Scraping detail: ${url}`);
+    
+    const cacheKey = `detail_${animeId}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        console.log(`✅ Cache HIT untuk detail ${animeId}`);
+        return cached;
+    }
+
     try {
-        browser = await puppeteer.launch({
-            headless: "new",
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--window-size=1920x1080'
-            ]
+        const $ = await scrapeWithBrowser(url, {
+            selector: '.anime__details__text',
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+            scroll: true,
+            scrollDistance: 1500,
+            delay: 300
         });
 
-        const page = await browser.newPage();
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer': 'https://kuramanime.ing/'
-        });
-        
-        await page.goto(url, {
-            waitUntil: 'networkidle2',
-            timeout: 60000
-        });
-
-        await page.waitForSelector('.anime__details__text', { timeout: 15000 });
-
-        await page.evaluate(async () => {
-            await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 100;
-                const timer = setInterval(() => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-                    if (totalHeight >= scrollHeight || totalHeight > 2000) {
-                        clearInterval(timer);
-                        resolve();
-                    }
-                }, 100);
-            });
-        });
-
-        await page.waitForTimeout(2000);
-
-        const html = await page.content();
-        const $ = cheerio.load(html);
-
-        // ============================================================
-        // 1. AMBIL INFORMASI DASAR
-        // ============================================================
-        
         const title = $('.anime__details__title h3').text().trim() || 
                       $('title').text().replace(' - Kuramanime', '').trim();
         
@@ -449,9 +376,6 @@ async function scrapeAnimeDetail(url, animeId) {
         const slugMatch = url.match(/\/anime\/(\d+)\/([^\/]+)/);
         const slug = slugMatch ? slugMatch[2] : '';
         
-        // ============================================================
-        // 2. SINOPIS
-        // ============================================================
         let synopsis = '';
         const synopsisElement = $('#synopsisField');
         if (synopsisElement.length) {
@@ -462,15 +386,9 @@ async function scrapeAnimeDetail(url, animeId) {
             synopsis = $('.anime__details__text p').first().text().trim() || '';
         }
         
-        // ============================================================
-        // 3. GAMBAR
-        // ============================================================
         const image = $('.anime__details__pic').attr('data-setbg') || 
                       $('meta[property="og:image"]').attr('content') || '';
         
-        // ============================================================
-        // 4. SKOR & STATISTIK
-        // ============================================================
         const scoreText = $('.anime__details__pic .ep').text().trim().replace('★', '').trim();
         const score = scoreText ? parseFloat(scoreText) : null;
         
@@ -479,9 +397,6 @@ async function scrapeAnimeDetail(url, animeId) {
         const comments = parseInt(commentsText) || 0;
         const views = parseInt(viewsText) || 0;
         
-        // ============================================================
-        // 5. INFO DETAIL
-        // ============================================================
         let studio = null;
         let status = null;
         let type = null;
@@ -495,9 +410,6 @@ async function scrapeAnimeDetail(url, animeId) {
         const genres = [];
         const themes = [];
         
-        // ============================================================
-        // CARI SEMUA LIST ITEM DARI WIDGET
-        // ============================================================
         let widgetItems = [];
         
         if ($('.anime__details__widget ul li').length > 0) {
@@ -625,7 +537,6 @@ async function scrapeAnimeDetail(url, animeId) {
                         let customUrl = studioUrl.replace(/^https?:\/\/[^\/]+/, '');
                         customUrl = customUrl.replace(/^\/properties\/studio\//, '/anime/studio/');
                         
-                        // Ambil semua studio (bisa lebih dari 1)
                         const studioNames = [];
                         studioLink.each((i, link) => {
                             const name = $(link).text().trim();
@@ -649,12 +560,8 @@ async function scrapeAnimeDetail(url, animeId) {
             }
         });
 
-        // ============================================================
-        // 6. DAFTAR EPISODE - TANPA VIEWS (karena tidak tersedia di detail)
-        // ============================================================
         const episodes = [];
         
-        // Cari dari popover content
         const popoverContent = $('.popover-body');
         if (popoverContent.length) {
             popoverContent.find('a.btn-danger').each((i, el) => {
@@ -671,7 +578,6 @@ async function scrapeAnimeDetail(url, animeId) {
             });
         }
         
-        // Jika tidak ada di popover, cari dari daftar episode
         if (episodes.length === 0) {
             $('.anime__details__episodes .episode a.ep-button').each((i, el) => {
                 const href = $(el).attr('href');
@@ -692,7 +598,6 @@ async function scrapeAnimeDetail(url, animeId) {
             });
         }
         
-        // Jika masih kosong, coba dari data-content popover
         if (episodes.length === 0) {
             const popoverData = $('[data-toggle="popover"]').first().attr('data-content');
             if (popoverData) {
@@ -712,26 +617,19 @@ async function scrapeAnimeDetail(url, animeId) {
             }
         }
 
-        // ============================================================
-        // 7. SERIAL YANG BERHUBUNGAN (RELATED ANIME)
-        // ============================================================
         const relatedAnime = [];
         
-        // Cari di .anime__details__review__related_anime
         $('.anime__details__review__related_anime .breadcrumb__links__v2').each((i, el) => {
             const $el = $(el);
             
-            // Cari label (Prekuel, Sekuel, Spin-off, dll)
             const $labelSpan = $el.find('.span__v2');
             let relationType = 'Related';
             if ($labelSpan.length) {
                 const labelText = $labelSpan.text().trim();
-                // Ambil teks setelah icon
                 const labelMatch = labelText.match(/<b>(.*?)<\/b>/);
                 if (labelMatch) {
                     relationType = labelMatch[1].trim();
                 } else {
-                    // Fallback: ambil dari text biasa
                     const cleanLabel = labelText.replace(/<[^>]*>/g, '').trim();
                     if (cleanLabel) {
                         relationType = cleanLabel;
@@ -739,30 +637,25 @@ async function scrapeAnimeDetail(url, animeId) {
                 }
             }
             
-            // Cari link anime terkait
             const $links = $el.find('a');
             $links.each((i, link) => {
                 const href = $(link).attr('href');
                 const name = $(link).text().trim();
                 
                 if (href && name) {
-                    // Extract ID dari URL
                     let relatedId = null;
                     const idMatch = href.match(/\/anime\/(\d+)/);
                     if (idMatch) {
                         relatedId = idMatch[1];
                     }
                     
-                    // Extract slug
                     let relatedSlug = '';
                     const slugMatch2 = href.match(/\/anime\/\d+\/([^\/]+)/);
                     if (slugMatch2) {
                         relatedSlug = slugMatch2[1];
                     }
                     
-                    // Custom URL: /anime/xxx -> /anime/detail/xxx
                     let customUrl = href.replace(/^https?:\/\/[^\/]+/, '');
-                    // Ganti /anime/ dengan /anime/detail/
                     customUrl = customUrl.replace(/^\/anime\//, '/anime/detail/');
                     
                     relatedAnime.push({
@@ -776,20 +669,16 @@ async function scrapeAnimeDetail(url, animeId) {
             });
         });
         
-        // Jika tidak ada di breadcrumb__links__v2, coba dari struktur lain
         if (relatedAnime.length === 0) {
-            // Cari di .anime__details__review__related_anime .breadcrumb__links__v2 .span__v2
             $('.anime__details__review__related_anime .breadcrumb__links__v2').each((i, el) => {
                 const $el = $(el);
                 const text = $el.text().trim();
                 
-                // Cari pola: "Prekuel: Nama Anime"
                 const relationMatch = text.match(/(Prekuel|Sekuel|Spin-off|Adaptasi|Lanjutan|Cerita Sampingan|Versi|OVA|Movie|Special|Episode|Musim|Terkait|Lainnya)\s*:\s*(.+)/i);
                 if (relationMatch) {
                     const relationType = relationMatch[1].trim();
                     const animeText = relationMatch[2].trim();
                     
-                    // Cari link di dalam elemen
                     const $link = $el.find('a');
                     if ($link.length) {
                         const href = $link.attr('href');
@@ -824,10 +713,7 @@ async function scrapeAnimeDetail(url, animeId) {
             });
         }
 
-        // ============================================================
-        // 8. COMPILE RESULT
-        // ============================================================
-        return {
+        const result = {
             id: animeId,
             slug: slug,
             title: title,
@@ -856,94 +742,42 @@ async function scrapeAnimeDetail(url, animeId) {
             relatedAnime: relatedAnime.length > 0 ? relatedAnime : null
         };
 
+        cache.set(cacheKey, result, 300); // Cache 5 menit untuk detail
+        console.log(`✅ Detail scraping selesai! (CACHED 5 menit)`);
+
+        return result;
+
     } catch (error) {
         console.error('❌ Error scraping detail:', error.message);
         throw error;
-    } finally {
-        if (browser) {
-            await browser.close();
-            console.log('🔒 Browser ditutup');
-        }
     }
 }
 
-
 // ============================================================
-// ENDPOINT: /anime/watch/:id/:slug/episode/:episode
+// 6. SCRAPE EPISODE
 // ============================================================
-app.get('/anime/watch/:id/:slug/episode/:episode', async (req, res) => {
-    try {
-        const animeId = req.params.id;
-        const slug = req.params.slug;
-        const episode = req.params.episode;
-        
-        // Validasi
-        if (!animeId || !/^\d+$/.test(animeId)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid anime ID'
-            });
-        }
-        
-        if (!episode || !/^\d+$/.test(episode)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid episode number'
-            });
-        }
-        
-        const url = `${BASE_URL}/anime/${animeId}/${slug}/episode/${episode}`;
-        console.log(`📡 Fetching episode: ${url}`);
-        
-        const result = await scrapeEpisode(url, animeId, slug, episode);
-        
-        if (!result || !result.streams || result.streams.length === 0) {
-            return res.status(404).json({
-                success: false,
-                error: 'Episode not found or no stream available'
-            });
-        }
-        
-        res.json({
-            success: true,
-            source: 'Kuramanime',
-            data: result
-        });
-        
-    } catch (error) {
-        console.error('❌ Error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// server-kuramanime.js - Perbaiki fungsi scrapeEpisode dengan lastUpdated
-
 async function scrapeEpisode(url, animeId, slug, episode) {
+    console.log(`🚀 Scraping episode: ${url}`);
+    
+    const cacheKey = `episode_${animeId}_${episode}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        console.log(`✅ Cache HIT untuk episode ${animeId}-${episode}`);
+        return cached;
+    }
+
     let browser = null;
     try {
-        browser = await puppeteer.launch({
-            headless: "new",
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--window-size=1920x1080'
-            ]
-        });
-
+        browser = await getBrowser();
         const page = await browser.newPage();
+
+        await page.setViewport({ width: 1280, height: 720 });
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         await page.setExtraHTTPHeaders({
             'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
             'Referer': 'https://kuramanime.ing/'
         });
         
-        // ============================================================
-        // INTERCEPT NETWORK REQUESTS - AMBIL URL VIDEO
-        // ============================================================
         const videoUrls = [];
         const m3u8Urls = [];
         
@@ -963,46 +797,26 @@ async function scrapeEpisode(url, animeId, slug, episode) {
             request.continue();
         });
 
-        // Navigasi
         await page.goto(url, {
-            waitUntil: 'networkidle2',
-            timeout: 60000
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
         });
 
-        // Tunggu video player
         try {
-            await page.waitForSelector('video#player', { timeout: 15000 });
+            await page.waitForSelector('video#player', { timeout: 10000 });
             console.log('✅ Video player ditemukan');
         } catch (e) {
-            console.log('⚠️ Video player tidak ditemukan, mencoba selector lain...');
+            console.log('⚠️ Video player tidak ditemukan');
         }
 
-        // Scroll
         await page.evaluate(async () => {
-            await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 100;
-                const timer = setInterval(() => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-                    if (totalHeight >= scrollHeight || totalHeight > 2000) {
-                        clearInterval(timer);
-                        resolve();
-                    }
-                }, 100);
-            });
+            window.scrollBy(0, 500);
+            await new Promise(resolve => setTimeout(resolve, 200));
         });
 
-        await page.waitForTimeout(3000);
-
-        // ============================================================
-        // EKSTRAK DARI HTML
-        // ============================================================
         const html = await page.content();
         const $ = cheerio.load(html);
 
-        // Ambil semua source dari video
         const sources = [];
         $('video#player source').each((i, el) => {
             const src = $(el).attr('src');
@@ -1015,7 +829,6 @@ async function scrapeEpisode(url, animeId, slug, episode) {
             }
         });
 
-        // Ambil direct src
         const directSrc = $('video#player').attr('src');
         if (directSrc && directSrc.includes('.mp4') && !sources.find(s => s.url === directSrc)) {
             sources.push({
@@ -1024,9 +837,6 @@ async function scrapeEpisode(url, animeId, slug, episode) {
             });
         }
 
-        // ============================================================
-        // AMBIL DARI NETWORK
-        // ============================================================
         videoUrls.forEach(url => {
             if (!sources.find(s => s.url === url)) {
                 let quality = 'auto';
@@ -1042,9 +852,6 @@ async function scrapeEpisode(url, animeId, slug, episode) {
             }
         });
 
-        // ============================================================
-        // AMBIL DARI SCRIPT EVALUATE
-        // ============================================================
         const scriptData = await page.evaluate(() => {
             const data = {
                 sources: [],
@@ -1078,72 +885,46 @@ async function scrapeEpisode(url, animeId, slug, episode) {
             return data;
         });
 
-        // Gabungkan dari script data
         scriptData.sources.forEach(s => {
             if (!sources.find(ex => ex.url === s.url)) {
                 sources.push(s);
             }
         });
 
-        // ============================================================
-        // AMBIL INFO EPISODE
-        // ============================================================
         const title = $('title').text().trim() || '';
         const animeTitle = $('.breadcrumb__links a').eq(2).text().trim() || '';
         
-        // ============================================================
-        // AMBIL LAST UPDATED
-        // ============================================================
         let lastUpdated = null;
         let updatedBy = null;
-        let updatedAt = null;
         
-        // Cari dari .breadcrumb__links__v2 yang berisi info update
         $('.breadcrumb__links__v2').each((i, el) => {
             const $el = $(el);
             const text = $el.text().trim();
             
-            // Cek apakah ini adalah elemen dengan info update
             if (text.includes('Terakhir diperbarui') || text.includes('terakhir diperbarui')) {
-                // Cari span dengan icon clock
                 const $span = $el.find('.span__v2');
                 if ($span.length) {
                     const labelText = $span.text().trim();
                     if (labelText.includes('Terakhir diperbarui') || labelText.includes('terakhir diperbarui')) {
-                        // Ambil seluruh teks
                         const fullText = $el.text().trim();
                         
-                        // Parse: "Terakhir diperbarui pada? Minggu, 05 Jul 2026, 10:49:16 WIB (sekitar 2 hari yang lalu) oleh Sora."
-                        // Cari pola tanggal
                         const dateMatch = fullText.match(/([A-Za-z]+,\s*\d{1,2}\s+[A-Za-z]+\s+\d{4},\s*\d{1,2}:\d{2}:\d{2}\s+[A-Za-z]+)/);
                         if (dateMatch) {
                             lastUpdated = dateMatch[1].trim();
                         }
                         
-                        // Cari "oleh XXX"
                         const byMatch = fullText.match(/oleh\s+([^\s.]+)/);
                         if (byMatch) {
                             updatedBy = byMatch[1].trim();
-                        }
-                        
-                        // Cari "sekitar X hari yang lalu"
-                        const daysAgoMatch = fullText.match(/sekitar\s+([\d,]+)\s+hari\s+yang\s+lalu/);
-                        if (daysAgoMatch) {
-                            const daysAgo = daysAgoMatch[1].replace(/,/g, '');
-                            // Jika ada, kita bisa simpan sebagai info tambahan
-                            // updatedAt = `${daysAgo} hari yang lalu`;
                         }
                     }
                 }
             }
         });
         
-        // Jika tidak ditemukan dengan cara di atas, coba dengan selector langsung
         if (!lastUpdated) {
-            // Cari elemen span yang mengandung teks "Terakhir diperbarui"
             $('span:contains("Terakhir diperbarui")').each((i, el) => {
                 const $el = $(el);
-                // Cari parent yang mengandung span tersebut
                 const $parent = $el.closest('.breadcrumb__links__v2');
                 if ($parent.length) {
                     const fullText = $parent.text().trim();
@@ -1158,19 +939,14 @@ async function scrapeEpisode(url, animeId, slug, episode) {
                 }
             });
         }
-        
-        // ============================================================
-        // AMBIL DAFTAR EPISODE DENGAN CUSTOM URL
-        // ============================================================
+
         const episodes = [];
         $('#animeEpisodes a.ep-button').each((i, el) => {
             const href = $(el).attr('href');
             const text = $(el).text().trim();
             const isActive = $(el).hasClass('active-ep');
             if (href) {
-                // Bersihkan URL
                 let cleanUrl = href.replace(/^https?:\/\/[^\/]+/, '');
-                // Ganti /anime/ dengan /anime/watch/
                 cleanUrl = cleanUrl.replace(/^\/anime\//, '/anime/watch/');
                 episodes.push({
                     episode: text,
@@ -1180,15 +956,9 @@ async function scrapeEpisode(url, animeId, slug, episode) {
             }
         });
 
-        // ============================================================
-        // AMBIL CREDIT
-        // ============================================================
         const credit = $('#episodeCredit').text().trim() || '';
 
-        // ============================================================
-        // COMPILE RESULT
-        // ============================================================
-        return {
+        const result = {
             animeId: animeId,
             slug: slug,
             episode: parseInt(episode),
@@ -1203,175 +973,59 @@ async function scrapeEpisode(url, animeId, slug, episode) {
             updatedBy: updatedBy || null
         };
 
+        // Cache 1 jam untuk episode (jarang berubah)
+        cache.set(cacheKey, result, 3600);
+        console.log(`✅ Episode scraping selesai! (CACHED 1 jam)`);
+
+        return result;
+
     } catch (error) {
         console.error('❌ Error scraping episode:', error.message);
         throw error;
     } finally {
         if (browser) {
-            await browser.close();
-            console.log('🔒 Browser ditutup');
+            await releaseBrowser();
         }
     }
 }
 
-
 // ============================================================
-// ENDPOINT: /anime/search
-// ============================================================
-app.get('/anime/search', async (req, res) => {
-    try {
-        const query = req.query.q || req.query.search || '';
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 20;
-        const orderBy = req.query.order_by || 'oldest';
-        
-        if (!query || query.trim() === '') {
-            return res.status(400).json({
-                success: false,
-                error: 'Search query is required. Use ?q=keyword'
-            });
-        }
-        
-        const encodedQuery = encodeURIComponent(query.trim());
-        const url = `${BASE_URL}/anime?order_by=${orderBy}&search=${encodedQuery}&page=${page}`;
-        
-        console.log(`📡 Searching: "${query}" (page ${page})`);
-        
-        const result = await scrapeSearchPage(url, query, page, orderBy);
-        
-        if (!result || !result.items || result.items.length === 0) {
-            return res.json({
-                success: true,
-                source: 'Kuramanime',
-                query: query,
-                pagination: {
-                    currentPage: page,
-                    totalPages: 1,
-                    hasNext: false,
-                    hasPrev: page > 1
-                },
-                total: 0,
-                data: []
-            });
-        }
-        
-        // Limit hasil
-        const items = result.items.slice(0, limit);
-        
-        res.json({
-            success: true,
-            source: 'Kuramanime',
-            query: query,
-            orderBy: orderBy,
-            pagination: {
-                currentPage: page,
-                totalPages: result.totalPages || 1,
-                hasNext: result.hasNext || false,
-                hasPrev: page > 1
-            },
-            total: items.length,
-            data: items
-        });
-        
-    } catch (error) {
-        console.error('❌ Error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ============================================================
-// Fungsi Scraping Search Page
+// 7. SCRAPE SEARCH
 // ============================================================
 async function scrapeSearchPage(url, query, page, orderBy) {
     console.log(`🚀 Searching: ${url}`);
     
-    let browser = null;
+    const cacheKey = `search_${query}_${page}_${orderBy}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        console.log(`✅ Cache HIT untuk search "${query}"`);
+        return cached;
+    }
+
     try {
-        browser = await puppeteer.launch({
-            headless: "new",
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--window-size=1920x1080'
-            ]
+        const $ = await scrapeWithBrowser(url, {
+            selector: '.product__item',
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+            scroll: true,
+            scrollDistance: 1500,
+            delay: 300
         });
 
-        const page = await browser.newPage();
-        
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer': 'https://kuramanime.ing/'
-        });
-
-        await page.goto(url, {
-            waitUntil: 'networkidle2',
-            timeout: 60000
-        });
-
-        // Tunggu konten
-        try {
-            await page.waitForSelector('.product__item', { timeout: 15000 });
-        } catch (e) {
-            // Jika tidak ada hasil, mungkin tidak ada anime ditemukan
-            const noResult = await page.$('.no-result');
-            if (noResult) {
-                console.log('⚠️ Tidak ada hasil ditemukan');
-                return {
-                    items: [],
-                    totalPages: 1,
-                    currentPage: page,
-                    hasNext: false
-                };
-            }
-        }
-
-        // Scroll
-        await page.evaluate(async () => {
-            await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 100;
-                const timer = setInterval(() => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-                    if (totalHeight >= scrollHeight || totalHeight > 3000) {
-                        clearInterval(timer);
-                        resolve();
-                    }
-                }, 100);
-            });
-        });
-
-        await page.waitForTimeout(2000);
-
-        const html = await page.content();
-        const $ = cheerio.load(html);
-
-        // ============================================================
-        // Ambil daftar anime hasil pencarian
-        // ============================================================
         const items = [];
         
         $('.product__item').each((i, el) => {
             const $el = $(el);
             
-            // CARI LINK DETAIL
             let episodeUrl = '';
             let animeId = null;
             let slug = '';
             
-            // Cari dari .product__item__pic a
             const $picLink = $el.find('.product__item__pic a');
             if ($picLink.length) {
                 episodeUrl = $picLink.attr('href') || '';
             }
             
-            // Jika kosong, cari dari .product__item__text h5 a
             if (!episodeUrl) {
                 const $titleLink = $el.find('.product__item__text h5 a');
                 if ($titleLink.length) {
@@ -1379,7 +1033,6 @@ async function scrapeSearchPage(url, query, page, orderBy) {
                 }
             }
             
-            // Jika masih kosong, cari dari a langsung
             if (!episodeUrl) {
                 const $anyLink = $el.find('a');
                 $anyLink.each((i, link) => {
@@ -1391,7 +1044,6 @@ async function scrapeSearchPage(url, query, page, orderBy) {
                 });
             }
             
-            // Bersihkan URL
             if (episodeUrl) {
                 const pathMatch = episodeUrl.match(/(\/anime\/\d+\/[^\/]+(?:\/episode\/\d+)?)/);
                 if (pathMatch) {
@@ -1401,7 +1053,6 @@ async function scrapeSearchPage(url, query, page, orderBy) {
                 }
             }
             
-            // Extract ID dan slug
             if (episodeUrl) {
                 const idMatch = episodeUrl.match(/\/anime\/(\d+)/);
                 if (idMatch) {
@@ -1414,15 +1065,13 @@ async function scrapeSearchPage(url, query, page, orderBy) {
                 }
             }
             
-            // Buat URL detail
             let detailUrl = '';
             if (animeId && slug) {
-                detailUrl = `/anime/${animeId}/${slug}`;
+                detailUrl = `/anime/detail/${animeId}/${slug}`;
             } else if (animeId) {
-                detailUrl = `/anime/${animeId}`;
+                detailUrl = `/anime/detail/${animeId}`;
             }
             
-            // Gambar
             const $pic = $el.find('.product__item__pic');
             let imageUrl = $pic.attr('data-setbg') || '';
             if (!imageUrl) {
@@ -1433,7 +1082,6 @@ async function scrapeSearchPage(url, query, page, orderBy) {
                 }
             }
             
-            // Score
             let score = null;
             const scoreEl = $el.find('.ep .actual-anime-\\d+');
             if (scoreEl.length) {
@@ -1443,12 +1091,10 @@ async function scrapeSearchPage(url, query, page, orderBy) {
                 }
             }
             
-            // Episode info
             const epText = $el.find('.ep span.actual-anime-\\d+').first().text().trim() || '';
             let currentEpisode = null;
             let totalEpisode = null;
             
-            // Coba dari class atau text
             const epSpan = $el.find('.ep span:not(.actual-anime-\\d+)');
             if (epSpan.length) {
                 const epInfo = epSpan.text().trim();
@@ -1459,17 +1105,14 @@ async function scrapeSearchPage(url, query, page, orderBy) {
                 }
             }
             
-            // Type & Quality
             const $type = $el.find('.product__item__text ul a:first-child li');
             const $quality = $el.find('.product__item__text ul a:last-child li');
             const type = $type.text().trim() || '';
             const quality = $quality.text().trim() || '';
             
-            // Title
             const $title = $el.find('.product__item__text h5 a');
             const title = $title.text().trim() || '';
             
-            // Comments & Views
             let comments = 0;
             let views = 0;
             
@@ -1501,9 +1144,6 @@ async function scrapeSearchPage(url, query, page, orderBy) {
             });
         });
 
-        // ============================================================
-        // Ambil pagination
-        // ============================================================
         let totalPages = 1;
         let hasNext = false;
         let currentPage = page;
@@ -1533,176 +1173,53 @@ async function scrapeSearchPage(url, query, page, orderBy) {
             }
         });
 
-        console.log(`✅ Pencarian selesai! Dapat ${items.length} hasil`);
-
-        return {
+        const result = {
             items: items,
             totalPages: totalPages,
             currentPage: currentPage,
             hasNext: hasNext
         };
 
+        // Cache 5 menit untuk search (jarang berubah)
+        cache.set(cacheKey, result, 300);
+        console.log(`✅ Pencarian selesai! Dapat ${items.length} hasil (CACHED 5 menit)`);
+
+        return result;
+
     } catch (error) {
         console.error('❌ Error searching:', error.message);
         throw error;
-    } finally {
-        if (browser) {
-            await browser.close();
-            console.log('🔒 Browser ditutup');
-        }
     }
 }
 
-
-// server-kuramanime.js - Tambahkan endpoint schedule
-
 // ============================================================
-// ENDPOINT: /schedule
+// 8. SCRAPE SCHEDULE
 // ============================================================
-app.get('/schedule', async (req, res) => {
-    try {
-        const day = req.query.day || 'all';
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 20;
-        
-        // Validasi day
-        const validDays = ['all', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'random'];
-        if (!validDays.includes(day)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid day. Valid values: all, monday, tuesday, wednesday, thursday, friday, saturday, sunday, random'
-            });
-        }
-        
-        let url;
-        if (day === 'all') {
-            url = `${BASE_URL}/schedule?page=${page}`;
-        } else {
-            url = `${BASE_URL}/schedule?scheduled_day=${day}&page=${page}`;
-        }
-        
-        console.log(`📡 Fetching schedule: ${url}`);
-        
-        const result = await scrapeSchedule(url, day, page);
-        
-        if (!result || !result.items || result.items.length === 0) {
-            return res.json({
-                success: true,
-                source: 'Kuramanime',
-                day: day,
-                pagination: {
-                    currentPage: page,
-                    totalPages: 1,
-                    hasNext: false,
-                    hasPrev: page > 1
-                },
-                total: 0,
-                data: []
-            });
-        }
-        
-        // Limit hasil
-        const items = result.items.slice(0, limit);
-        
-        res.json({
-            success: true,
-            source: 'Kuramanime',
-            day: day,
-            pagination: {
-                currentPage: page,
-                totalPages: result.totalPages || 1,
-                hasNext: result.hasNext || false,
-                hasPrev: page > 1
-            },
-            total: items.length,
-            data: items
-        });
-        
-    } catch (error) {
-        console.error('❌ Error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// server-kuramanime.js - Perbaiki fungsi scrapeSchedule
-
 async function scrapeSchedule(url, day, page) {
     console.log(`🚀 Fetching schedule: ${url}`);
     
-    let browser = null;
+    const cacheKey = `schedule_${day}_${page}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        console.log(`✅ Cache HIT untuk schedule ${day}`);
+        return cached;
+    }
+
     try {
-        browser = await puppeteer.launch({
-            headless: "new",
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--window-size=1920x1080'
-            ]
+        const $ = await scrapeWithBrowser(url, {
+            selector: '.product__item',
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+            scroll: true,
+            scrollDistance: 1500,
+            delay: 300
         });
 
-        const page = await browser.newPage();
-        
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer': 'https://kuramanime.ing/'
-        });
-
-        await page.goto(url, {
-            waitUntil: 'networkidle2',
-            timeout: 60000
-        });
-
-        // Tunggu konten
-        try {
-            await page.waitForSelector('.product__item', { timeout: 15000 });
-        } catch (e) {
-            console.log('⚠️ Tidak ada jadwal ditemukan');
-            return {
-                items: [],
-                totalPages: 1,
-                currentPage: page,
-                hasNext: false
-            };
-        }
-
-        // Scroll
-        await page.evaluate(async () => {
-            await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 100;
-                const timer = setInterval(() => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-                    if (totalHeight >= scrollHeight || totalHeight > 3000) {
-                        clearInterval(timer);
-                        resolve();
-                    }
-                }, 100);
-            });
-        });
-
-        await page.waitForTimeout(2000);
-
-        const html = await page.content();
-        const $ = cheerio.load(html);
-
-        // ============================================================
-        // Ambil daftar jadwal - PERBAIKAN
-        // ============================================================
         const items = [];
         
         $('.product__item').each((i, el) => {
             const $el = $(el);
             
-            // ============================================================
-            // CARI LINK
-            // ============================================================
             let detailUrl = '';
             let animeId = null;
             let slug = '';
@@ -1740,9 +1257,6 @@ async function scrapeSchedule(url, day, page) {
                 }
             }
             
-            // ============================================================
-            // GAMBAR
-            // ============================================================
             const $pic = $el.find('.product__item__pic');
             let imageUrl = $pic.attr('data-setbg') || '';
             if (!imageUrl) {
@@ -1753,19 +1267,14 @@ async function scrapeSchedule(url, day, page) {
                 }
             }
             
-            // ============================================================
-            // EPISODE INFO - PERBAIKAN
-            // ============================================================
             let nextEpisode = null;
             let isFinished = false;
             
-            // Cari semua span di dalam .ep
             const epSpans = $el.find('.ep span');
             
             epSpans.each((i, span) => {
                 const text = $(span).text().trim();
                 
-                // Cek "Selanjutnya: Ep X"
                 if (text.includes('Selanjutnya: Ep')) {
                     const match = text.match(/Selanjutnya:\s*Ep\s*(\d+)/);
                     if (match) {
@@ -1773,13 +1282,11 @@ async function scrapeSchedule(url, day, page) {
                     }
                 }
                 
-                // Cek "Sudah Selesai"
                 if (text === 'Sudah Selesai') {
                     isFinished = true;
                 }
             });
             
-            // Cek dari class actual-schedule-ep
             const actualEp = $el.find('.actual-schedule-ep-\\d+');
             if (actualEp.length && !nextEpisode) {
                 const text = actualEp.text().trim();
@@ -1791,13 +1298,9 @@ async function scrapeSchedule(url, day, page) {
                 }
             }
             
-            // ============================================================
-            // SCHEDULE INFO (Hari & Jam) - PERBAIKAN
-            // ============================================================
             let scheduleDay = null;
             let scheduleTime = null;
             
-            // Cara 1: Dari .view-end .actual-schedule-info-{id}
             const scheduleInfo = $el.find('.view-end .actual-schedule-info-\\d+');
             if (scheduleInfo.length >= 2) {
                 const dayText = scheduleInfo.eq(0).text().trim();
@@ -1806,7 +1309,6 @@ async function scrapeSchedule(url, day, page) {
                 if (timeText) scheduleTime = timeText;
             }
             
-            // Cara 2: Dari .view-end ul li
             if (!scheduleDay || !scheduleTime) {
                 const viewEndLis = $el.find('.view-end ul li');
                 viewEndLis.each((i, li) => {
@@ -1826,10 +1328,8 @@ async function scrapeSchedule(url, day, page) {
                 });
             }
             
-            // Cara 3: Dari .view-end langsung (tanpa span)
             if (!scheduleDay || !scheduleTime) {
                 const viewEndText = $el.find('.view-end').text().trim();
-                // Coba parse "Senin 21:54 WIB"
                 const match = viewEndText.match(/(Senin|Selasa|Rabu|Kamis|Jumat|Sabtu|Minggu)\s+(\d{2}:\d{2}\s*WIB)/);
                 if (match) {
                     scheduleDay = match[1];
@@ -1837,23 +1337,14 @@ async function scrapeSchedule(url, day, page) {
                 }
             }
             
-            // ============================================================
-            // TYPE & QUALITY
-            // ============================================================
             const $type = $el.find('.product__item__text ul a:first-child li');
             const $quality = $el.find('.product__item__text ul a:last-child li');
             const type = $type.text().trim() || '';
             const quality = $quality.text().trim() || '';
             
-            // ============================================================
-            // TITLE
-            // ============================================================
             const $title = $el.find('.product__item__text h5 a');
             const title = $title.text().trim() || '';
             
-            // ============================================================
-            // PUSH DATA
-            // ============================================================
             items.push({
                 id: animeId,
                 slug: slug,
@@ -1871,9 +1362,6 @@ async function scrapeSchedule(url, day, page) {
             });
         });
 
-        // ============================================================
-        // Ambil pagination
-        // ============================================================
         let totalPages = 1;
         let hasNext = false;
         let currentPage = page;
@@ -1887,7 +1375,6 @@ async function scrapeSchedule(url, day, page) {
             }
         });
         
-        // Cek next page dari link terakhir
         const lastLink = pageLinks.last();
         if (lastLink.length) {
             const href = lastLink.attr('href') || '';
@@ -1903,44 +1390,453 @@ async function scrapeSchedule(url, day, page) {
             }
         }
 
-        console.log(`✅ Schedule selesai! Dapat ${items.length} jadwal`);
-
-        return {
+        const result = {
             items: items,
             totalPages: totalPages,
             currentPage: currentPage,
             hasNext: hasNext
         };
 
+        // Cache 1 jam untuk schedule (jarang berubah)
+        cache.set(cacheKey, result, 3600);
+        console.log(`✅ Schedule selesai! Dapat ${items.length} jadwal (CACHED 1 jam)`);
+
+        return result;
+
     } catch (error) {
         console.error('❌ Error fetching schedule:', error.message);
         throw error;
-    } finally {
-        if (browser) {
-            await browser.close();
-            console.log('🔒 Browser ditutup');
-        }
     }
 }
 
-
-
-
+// ============================================================
+// 9. ENDPOINTS
+// ============================================================
 
 // ============================================================
-// Jalankan server
+// 9a. ENDPOINT: /anime/latest
+// ============================================================
+app.get('/anime/latest', async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const forceRefresh = req.query.refresh === 'true';
+        
+        const url = `${BASE_URL}/quick/ongoing?order_by=updated&page=${page}`;
+        
+        let result;
+        if (forceRefresh) {
+            // Force refresh: hapus cache dulu
+            const cacheKey = `ongoing_${url}`;
+            cache.del(cacheKey);
+            console.log(`🔄 Force refresh untuk ${url}`);
+        }
+        
+        result = await scrapeOngoingPage(url);
+        
+        const pagination = {
+            currentPage: page,
+            totalPages: result.totalPages || 1,
+            hasNext: result.hasNext || false,
+            hasPrev: page > 1
+        };
+        
+        const items = result.items.slice(0, limit);
+        
+        res.json({
+            success: true,
+            source: 'Kuramanime',
+            url: url,
+            pagination: pagination,
+            total: items.length,
+            data: items,
+            cached: cache.get(`ongoing_${url}`) ? true : false,
+            fetchedAt: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================================
+// 9b. ENDPOINT: /anime/detail/:id/:slug?
+// ============================================================
+app.get('/anime/detail/:id/:slug?', async (req, res) => {
+    try {
+        const animeId = req.params.id;
+        const slug = req.params.slug || '';
+        const forceRefresh = req.query.refresh === 'true';
+        
+        if (!animeId || !/^\d+$/.test(animeId)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid anime ID. Must be a number.'
+            });
+        }
+        
+        let url;
+        if (slug) {
+            url = `${BASE_URL}/anime/${animeId}/${slug}`;
+        } else {
+            url = `${BASE_URL}/anime/${animeId}`;
+        }
+        
+        if (forceRefresh) {
+            const cacheKey = `detail_${animeId}`;
+            cache.del(cacheKey);
+            console.log(`🔄 Force refresh untuk detail ${animeId}`);
+        }
+        
+        console.log(`📡 Fetching anime detail: ${url}`);
+        
+        const result = await scrapeAnimeDetail(url, animeId);
+        
+        if (!result || !result.id) {
+            return res.status(404).json({
+                success: false,
+                error: 'Anime not found'
+            });
+        }
+        
+        res.json({
+            success: true,
+            source: 'Kuramanime',
+            data: result,
+            cached: cache.get(`detail_${animeId}`) ? true : false,
+            fetchedAt: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================================
+// 9c. ENDPOINT: /anime/watch/:id/:slug/episode/:episode
+// ============================================================
+app.get('/anime/watch/:id/:slug/episode/:episode', async (req, res) => {
+    try {
+        const animeId = req.params.id;
+        const slug = req.params.slug;
+        const episode = req.params.episode;
+        const forceRefresh = req.query.refresh === 'true';
+        
+        if (!animeId || !/^\d+$/.test(animeId)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid anime ID'
+            });
+        }
+        
+        if (!episode || !/^\d+$/.test(episode)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid episode number'
+            });
+        }
+        
+        if (forceRefresh) {
+            const cacheKey = `episode_${animeId}_${episode}`;
+            cache.del(cacheKey);
+            console.log(`🔄 Force refresh untuk episode ${animeId}-${episode}`);
+        }
+        
+        const url = `${BASE_URL}/anime/${animeId}/${slug}/episode/${episode}`;
+        console.log(`📡 Fetching episode: ${url}`);
+        
+        const result = await scrapeEpisode(url, animeId, slug, episode);
+        
+        if (!result || !result.streams || result.streams.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Episode not found or no stream available'
+            });
+        }
+        
+        res.json({
+            success: true,
+            source: 'Kuramanime',
+            data: result,
+            cached: cache.get(`episode_${animeId}_${episode}`) ? true : false,
+            fetchedAt: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================================
+// 9d. ENDPOINT: /anime/search
+// ============================================================
+app.get('/anime/search', async (req, res) => {
+    try {
+        const query = req.query.q || req.query.search || '';
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const orderBy = req.query.order_by || 'oldest';
+        const forceRefresh = req.query.refresh === 'true';
+        
+        if (!query || query.trim() === '') {
+            return res.status(400).json({
+                success: false,
+                error: 'Search query is required. Use ?q=keyword'
+            });
+        }
+        
+        const encodedQuery = encodeURIComponent(query.trim());
+        const url = `${BASE_URL}/anime?order_by=${orderBy}&search=${encodedQuery}&page=${page}`;
+        
+        if (forceRefresh) {
+            const cacheKey = `search_${query}_${page}_${orderBy}`;
+            cache.del(cacheKey);
+            console.log(`🔄 Force refresh untuk search "${query}"`);
+        }
+        
+        console.log(`📡 Searching: "${query}" (page ${page})`);
+        
+        const result = await scrapeSearchPage(url, query, page, orderBy);
+        
+        if (!result || !result.items || result.items.length === 0) {
+            return res.json({
+                success: true,
+                source: 'Kuramanime',
+                query: query,
+                pagination: {
+                    currentPage: page,
+                    totalPages: 1,
+                    hasNext: false,
+                    hasPrev: page > 1
+                },
+                total: 0,
+                data: []
+            });
+        }
+        
+        const items = result.items.slice(0, limit);
+        
+        res.json({
+            success: true,
+            source: 'Kuramanime',
+            query: query,
+            orderBy: orderBy,
+            pagination: {
+                currentPage: page,
+                totalPages: result.totalPages || 1,
+                hasNext: result.hasNext || false,
+                hasPrev: page > 1
+            },
+            total: items.length,
+            data: items,
+            cached: cache.get(`search_${query}_${page}_${orderBy}`) ? true : false,
+            fetchedAt: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================================
+// 9e. ENDPOINT: /schedule
+// ============================================================
+app.get('/schedule', async (req, res) => {
+    try {
+        const day = req.query.day || 'all';
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const forceRefresh = req.query.refresh === 'true';
+        
+        const validDays = ['all', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'random'];
+        if (!validDays.includes(day)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid day. Valid values: all, monday, tuesday, wednesday, thursday, friday, saturday, sunday, random'
+            });
+        }
+        
+        let url;
+        if (day === 'all') {
+            url = `${BASE_URL}/schedule?page=${page}`;
+        } else {
+            url = `${BASE_URL}/schedule?scheduled_day=${day}&page=${page}`;
+        }
+        
+        if (forceRefresh) {
+            const cacheKey = `schedule_${day}_${page}`;
+            cache.del(cacheKey);
+            console.log(`🔄 Force refresh untuk schedule ${day}`);
+        }
+        
+        console.log(`📡 Fetching schedule: ${url}`);
+        
+        const result = await scrapeSchedule(url, day, page);
+        
+        if (!result || !result.items || result.items.length === 0) {
+            return res.json({
+                success: true,
+                source: 'Kuramanime',
+                day: day,
+                pagination: {
+                    currentPage: page,
+                    totalPages: 1,
+                    hasNext: false,
+                    hasPrev: page > 1
+                },
+                total: 0,
+                data: []
+            });
+        }
+        
+        const items = result.items.slice(0, limit);
+        
+        res.json({
+            success: true,
+            source: 'Kuramanime',
+            day: day,
+            pagination: {
+                currentPage: page,
+                totalPages: result.totalPages || 1,
+                hasNext: result.hasNext || false,
+                hasPrev: page > 1
+            },
+            total: items.length,
+            data: items,
+            cached: cache.get(`schedule_${day}_${page}`) ? true : false,
+            fetchedAt: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================================
+// 10. CACHE MANAGEMENT ENDPOINTS
+// ============================================================
+
+// Clear semua cache
+app.post('/cache/clear', (req, res) => {
+    cache.flushAll();
+    console.log('🧹 Cache cleared!');
+    res.json({
+        success: true,
+        message: 'Cache cleared successfully'
+    });
+});
+
+// Clear cache spesifik
+app.post('/cache/clear/:key', (req, res) => {
+    const key = req.params.key;
+    const deleted = cache.del(key);
+    console.log(`🧹 Cache key "${key}" ${deleted ? 'deleted' : 'not found'}`);
+    res.json({
+        success: true,
+        deleted: deleted > 0,
+        key: key
+    });
+});
+
+// Lihat stats cache
+app.get('/cache/stats', (req, res) => {
+    res.json({
+        success: true,
+        stats: cache.getStats(),
+        keys: cache.keys(),
+        totalKeys: cache.keys().length
+    });
+});
+
+// ============================================================
+// 11. ROOT ENDPOINT
+// ============================================================
+app.get('/', (req, res) => {
+    res.json({
+        name: 'Kuramanime API',
+        version: '2.0.0',
+        status: 'running',
+        endpoints: {
+            '/anime/latest': 'GET - Latest anime (cached 30s)',
+            '/anime/detail/:id/:slug?': 'GET - Anime detail (cached 5m)',
+            '/anime/watch/:id/:slug/episode/:episode': 'GET - Episode stream (cached 1h)',
+            '/anime/search': 'GET - Search anime (cached 5m)',
+            '/schedule': 'GET - Schedule (cached 1h)',
+            '/cache/stats': 'GET - Cache statistics',
+            '/cache/clear': 'POST - Clear all cache',
+            '/cache/clear/:key': 'POST - Clear specific cache'
+        },
+        query_params: {
+            refresh: 'Force refresh (bypass cache)',
+            page: 'Page number',
+            limit: 'Items per page',
+            day: 'Schedule day (all, monday, etc)',
+            q: 'Search query'
+        }
+    });
+});
+
+// ============================================================
+// 12. START SERVER
 // ============================================================
 app.listen(PORT, () => {
     console.log('='.repeat(60));
-    console.log('🚀 KURAMANIME API SERVER');
+    console.log('🚀 KURAMANIME API SERVER (OPTIMIZED v2.0)');
     console.log('='.repeat(60));
     console.log(`✅ Server running on http://localhost:${PORT}`);
     console.log('');
+    console.log('📊 CACHE CONFIGURATION:');
+    console.log('  📌 /anime/latest     → 30 detik');
+    console.log('  📌 /anime/detail     → 5 menit');
+    console.log('  📌 /anime/watch      → 1 jam');
+    console.log('  📌 /anime/search     → 5 menit');
+    console.log('  📌 /schedule         → 1 jam');
+    console.log('');
+    console.log('📌 OPTIMASI:');
+    console.log('  ✅ Reuse browser instance');
+    console.log('  ✅ Smart cache dengan TTL berbeda');
+    console.log('  ✅ Block resource tidak perlu');
+    console.log('  ✅ Force refresh via ?refresh=true');
+    console.log('  ✅ Cache management endpoints');
+    console.log('');
     console.log('📌 ENDPOINTS:');
-    console.log(`  GET /anime/latest?page=1&limit=20  - Daftar anime terbaru`);
-    console.log(`  GET /anime/latest/detail/:id        - Detail anime + episode list`);
+    console.log(`  GET  /                             - API Info`);
+    console.log(`  GET  /anime/latest?page=1&limit=20 - Latest anime`);
+    console.log(`  GET  /anime/detail/:id/:slug?      - Anime detail`);
+    console.log(`  GET  /anime/watch/:id/:slug/episode/:episode - Watch episode`);
+    console.log(`  GET  /anime/search?q=keyword       - Search anime`);
+    console.log(`  GET  /schedule?day=all             - Schedule`);
+    console.log(`  GET  /cache/stats                  - Cache stats`);
+    console.log(`  POST /cache/clear                  - Clear cache`);
+    console.log(`  POST /cache/clear/:key             - Clear specific cache`);
     console.log('='.repeat(60));
 });
 
 // Export untuk testing
-export { scrapeOngoingPage, scrapeAnimeDetail };
+export { 
+    scrapeOngoingPage, 
+    scrapeAnimeDetail, 
+    scrapeEpisode,
+    scrapeSearchPage,
+    scrapeSchedule
+};
