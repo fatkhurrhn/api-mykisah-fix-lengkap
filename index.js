@@ -73,8 +73,8 @@ async function scrapeOngoingPage(url) {
         browser = await puppeteer.launch({
             headless: "new",
             args: [
-                '--no-sandbox',                // <-- Tambahkan ini
-                '--disable-setuid-sandbox',    // <-- ini sudah ada
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--window-size=1920x1080'
             ]
